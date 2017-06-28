@@ -1,0 +1,229 @@
+diff --git a/tensorflow/contrib/opt/python/training/delay_compensated_gradient_descent.py b/tensorflow/contrib/opt/python/training/delay_compensated_gradient_descent.py
+index 5a5e67e..cc938c7 100644
+--- a/tensorflow/contrib/opt/python/training/delay_compensated_gradient_descent.py
++++ b/tensorflow/contrib/opt/python/training/delay_compensated_gradient_descent.py
+@@ -238,6 +238,17 @@ class DelayCompensatedGradientDescentOptimizer(optimizer.Optimizer):
+         self._get_or_make_slot(v, var2, "shadow_{0}".format(index),
+                                self._name)
+ 
++  def _apply_dense(self, grad, var, worker_index=0):
++    # Get previous value of the variable from the slot
++    shadow = self.get_slot(var, "shadow_{0}".format(worker_index))
++    return training_ops.apply_delay_compensated_gradient_descent(
++       var,
++       math_ops.cast(self._learning_rate_tensor, grad.dtype.base_dtype),
++       grad,
++       math_ops.cast(self._lambda_tensor, grad.dtype.base_dtype),
++       shadow,
++       use_locking=self._use_locking)
++
+   def _resource_apply_dense(self, grad, var, worker_index=0):
+     # Get previous value of the variable from the slot
+     shadow = self.get_slot(var, "shadow_{0}".format(worker_index))
+diff --git a/tensorflow/core/kernels/training_ops.cc b/tensorflow/core/kernels/training_ops.cc
+index 8e2d6dc..bfc2e63 100644
+--- a/tensorflow/core/kernels/training_ops.cc
++++ b/tensorflow/core/kernels/training_ops.cc
+@@ -453,6 +453,9 @@ class ApplyDelayCompensatedGradientDescentOp : public OpKernel {
+   bool use_exclusive_lock_;
+ };
+ 
++using CPUDevice = Eigen::ThreadPoolDevice;
++using GPUDevice = Eigen::GpuDevice;
++
+ #define REGISTER_KERNELS(D, T)                                 \
+   REGISTER_KERNEL_BUILDER(                                     \
+       Name("ApplyDelayCompensatedGradientDescent")             \
+@@ -467,6 +470,28 @@ TF_CALL_half(REGISTER_CPU_KERNELS);
+ TF_CALL_float(REGISTER_CPU_KERNELS);
+ TF_CALL_double(REGISTER_CPU_KERNELS);
+ 
++#if GOOGLE_CUDA
++// Forward declarations of the functor specializations for GPU.
++namespace functor {
++#define DECLARE_GPU_SPEC(T)                                             \
++  template <>                                                           \
++  void ApplyDelayCompensatedGradientDescent<GPUDevice, T>::operator()(  \
++      const GPUDevice& d, typename TTypes<T>::Flat var,                 \
++      typename TTypes<T>::ConstScalar lr,                               \
++      typename TTypes<T>::ConstFlat grad,                               \
++      typename TTypes<T>::ConstScalar variance,                         \
++      typename TTypes<T>::Flat shadow);                                 \
++  extern template struct ApplyDelayCompensatedGradientDescent<GPUDevice, T>;
++DECLARE_GPU_SPEC(Eigen::half);
++DECLARE_GPU_SPEC(float);
++DECLARE_GPU_SPEC(double);
++#undef DECLARE_GPU_SPEC
++}  // namespace functor
++
++REGISTER_KERNELS(GPU, Eigen::half);
++REGISTER_KERNELS(GPU, float);
++REGISTER_KERNELS(GPU, double);
++#endif
+ #undef REGISTER_CPU_KERNELS
+ #undef REGISTER_KERNELS
+ 
+diff --git a/tensorflow/core/kernels/training_ops_gpu.cu.cc b/tensorflow/core/kernels/training_ops_gpu.cu.cc
+index 3678b96..091d16a 100644
+--- a/tensorflow/core/kernels/training_ops_gpu.cu.cc
++++ b/tensorflow/core/kernels/training_ops_gpu.cu.cc
+@@ -38,6 +38,21 @@ struct ApplyGradientDescent<GPUDevice, T> {
+ };
+ 
+ template <typename T>
++struct ApplyDelayCompensatedGradientDescent<GPUDevice, T> {
++  void operator()(const GPUDevice& d, typename TTypes<T>::Flat var,
++                  typename TTypes<T>::ConstScalar lr,
++                  typename TTypes<T>::ConstFlat grad,
++                  typename TTypes<T>::ConstScalar variance,
++                  typename TTypes<T>::Flat shadow) {
++    Eigen::array<typename TTypes<T>::Tensor::Index, 1> bcast;
++    bcast[0] = grad.dimension(0);
++    Eigen::Sizes<1> single;
++    var.device(d) -= lr.reshape(single).broadcast(bcast) * (grad + variance.reshape(single).broadcast(bcast) * grad * (var-shadow));
++    shadow.device(d) = var;
++  }
++};
++
++template <typename T>
+ struct ApplyAdagrad<GPUDevice, T> {
+   void operator()(const GPUDevice& d, typename TTypes<T>::Flat var,
+                   typename TTypes<T>::Flat accum,
+@@ -199,6 +214,10 @@ template struct functor::ApplyGradientDescent<GPUDevice, Eigen::half>;
+ template struct functor::ApplyGradientDescent<GPUDevice, float>;
+ template struct functor::ApplyGradientDescent<GPUDevice, double>;
+ 
++template struct functor::ApplyDelayCompensatedGradientDescent<GPUDevice, Eigen::half>;
++template struct functor::ApplyDelayCompensatedGradientDescent<GPUDevice, float>;
++template struct functor::ApplyDelayCompensatedGradientDescent<GPUDevice, double>;
++
+ template struct functor::ApplyAdagrad<GPUDevice, Eigen::half>;
+ template struct functor::ApplyAdagrad<GPUDevice, float>;
+ template struct functor::ApplyAdagrad<GPUDevice, double>;
+diff --git a/tensorflow/core/ops/training_ops.cc b/tensorflow/core/ops/training_ops.cc
+index a786fed..e7924b5 100644
+--- a/tensorflow/core/ops/training_ops.cc
++++ b/tensorflow/core/ops/training_ops.cc
+@@ -103,6 +103,29 @@ use_locking: If `True`, the subtraction will be protected by a lock;
+ )doc");
+ 
+ REGISTER_OP("ApplyDelayCompensatedGradientDescent")
++    .Input("var: Ref(T)")
++    .Input("alpha: T")
++    .Input("delta: T")
++    .Input("lambda: T")
++    .Input("shadow: Ref(T)")
++    .Output("out: Ref(T)")
++    .Attr("T: numbertype")
++    .Attr("use_locking: bool = false")
++    .SetShapeFn(ApplyGradientDescentShapeFn)
++    .Doc(R"doc(
++var -= alpha * (delta + lambda * delta * (var - shadow))
++Update '*shadow' by changing it to the new value of 'var'
++
++var: Should be from a Variable().
++alpha: Scaling factor. Must be a scalar.
++delta: The change.
++lambda: The variance parameter.
++shadow: Same as "var".
++use_locking: If `True`, the subtraction will be protected by a lock;
++  otherwise the behavior is undefined, but may exhibit less contention.
++)doc");
++
++REGISTER_OP("ResourceApplyDelayCompensatedGradientDescent")
+     .Input("var: resource")
+     .Input("alpha: T")
+     .Input("delta: T")
+diff --git a/tensorflow/examples/tutorials/mnist/mnist_softmax_dc_asgd.py b/tensorflow/examples/tutorials/mnist/mnist_softmax_dc_asgd.py
+new file mode 100644
+index 0000000..11cc6cd
+--- /dev/null
++++ b/tensorflow/examples/tutorials/mnist/mnist_softmax_dc_asgd.py
+@@ -0,0 +1,87 @@
++# Copyright 2015 The TensorFlow Authors. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ==============================================================================
++
++"""A very simple MNIST classifier.
++
++See extensive documentation at
++https://www.tensorflow.org/get_started/mnist/beginners
++"""
++from __future__ import absolute_import
++from __future__ import division
++from __future__ import print_function
++
++import argparse
++import sys
++
++from tensorflow.examples.tutorials.mnist import input_data
++from tensorflow.contrib.opt.python.training import delay_compensated_gradient_descent 
++from tensorflow.python import debug as tf_debug
++import tensorflow as tf
++
++FLAGS = None
++
++
++def main(_):
++  # Import data
++  mnist = input_data.read_data_sets(FLAGS.data_dir, one_hot=True)
++
++  # Create the model
++  x = tf.placeholder(tf.float32, [None, 784],name='x')
++  W = tf.Variable(tf.zeros([784, 10]),dtype=tf.float32,name='w')
++  b = tf.Variable(tf.zeros([10]),dtype=tf.float32,name='b')
++  y = tf.matmul(x, W) + b
++
++  # Define loss and optimizer
++  y_ = tf.placeholder(tf.float32, [None, 10])
++
++  # The raw formulation of cross-entropy,
++  #
++  #   tf.reduce_mean(-tf.reduce_sum(y_ * tf.log(tf.nn.softmax(y)),
++  #                                 reduction_indices=[1]))
++  #
++  # can be numerically unstable.
++  #
++  # So here we use tf.nn.softmax_cross_entropy_with_logits on the raw
++  # outputs of 'y', and then average across the batch.
++  cross_entropy = tf.reduce_mean(
++      tf.nn.softmax_cross_entropy_with_logits(labels=y_, logits=y))
++  #train_step = tf.train.GradientDescentOptimizer(0.5).minimize(cross_entropy)
++  optimizer = (delay_compensated_gradient_descent.
++                     DelayCompensatedGradientDescentOptimizer)(
++                         learning_rate=3.0,
++                         variance_parameter=2.0,
++                         num_workers=1)
++  train_step = optimizer.minimize(cross_entropy,worker_index=0)
++
++  sess = tf.InteractiveSession()
++  tf.global_variables_initializer().run()
++  sess = tf_debug.LocalCLIDebugWrapperSession(sess)
++  # Train
++  for _ in range(1):
++    batch_xs, batch_ys = mnist.train.next_batch(100)
++    sess.run(train_step, feed_dict={x: batch_xs, y_: batch_ys})
++
++  # Test trained model
++  correct_prediction = tf.equal(tf.argmax(y, 1), tf.argmax(y_, 1))
++  accuracy = tf.reduce_mean(tf.cast(correct_prediction, tf.float32))
++  print(sess.run(accuracy, feed_dict={x: mnist.test.images,
++                                      y_: mnist.test.labels}))
++
++if __name__ == '__main__':
++  parser = argparse.ArgumentParser()
++  parser.add_argument('--data_dir', type=str, default='/tmp/tensorflow/mnist/input_data',
++                      help='Directory for storing input data')
++  FLAGS, unparsed = parser.parse_known_args()
++  tf.app.run(main=main, argv=[sys.argv[0]] + unparsed)
