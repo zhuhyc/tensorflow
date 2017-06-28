@@ -38,6 +38,21 @@ struct ApplyGradientDescent<GPUDevice, T> {
 };
 
 template <typename T>
+struct ApplyDelayCompensatedGradientDescent<GPUDevice, T> {
+  void operator()(const GPUDevice& d, typename TTypes<T>::Flat var,
+                  typename TTypes<T>::ConstScalar lr,
+                  typename TTypes<T>::ConstFlat grad,
+                  typename TTypes<T>::ConstScalar variance,
+                  typename TTypes<T>::Flat shadow) {
+    Eigen::array<typename TTypes<T>::Tensor::Index, 1> bcast;
+    bcast[0] = grad.dimension(0);
+    Eigen::Sizes<1> single;
+    var.device(d) -= lr.reshape(single).broadcast(bcast) * (grad + variance.reshape(single).broadcast(bcast) * grad * (var-shadow));
+    shadow.device(d) = var;
+  }
+};
+
+template <typename T>
 struct ApplyAdagrad<GPUDevice, T> {
   void operator()(const GPUDevice& d, typename TTypes<T>::Flat var,
                   typename TTypes<T>::Flat accum,
@@ -198,6 +213,10 @@ struct ApplyCenteredRMSProp<GPUDevice, T> {
 template struct functor::ApplyGradientDescent<GPUDevice, Eigen::half>;
 template struct functor::ApplyGradientDescent<GPUDevice, float>;
 template struct functor::ApplyGradientDescent<GPUDevice, double>;
+
+template struct functor::ApplyDelayCompensatedGradientDescent<GPUDevice, Eigen::half>;
+template struct functor::ApplyDelayCompensatedGradientDescent<GPUDevice, float>;
+template struct functor::ApplyDelayCompensatedGradientDescent<GPUDevice, double>;
 
 template struct functor::ApplyAdagrad<GPUDevice, Eigen::half>;
 template struct functor::ApplyAdagrad<GPUDevice, float>;

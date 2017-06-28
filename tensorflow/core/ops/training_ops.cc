@@ -104,6 +104,29 @@ use_locking: If `True`, the subtraction will be protected by a lock;
 )doc");
 
 REGISTER_OP("ApplyDelayCompensatedGradientDescent")
+    .Input("var: Ref(T)")
+    .Input("alpha: T")
+    .Input("delta: T")
+    .Input("lambda: T")
+    .Input("shadow: Ref(T)")
+    .Output("out: Ref(T)")
+    .Attr("T: numbertype")
+    .Attr("use_locking: bool = false")
+    .SetShapeFn(ApplyGradientDescentShapeFn)
+    .Doc(R"doc(
+var -= alpha * (delta + lambda * delta * (var - shadow))
+Update '*shadow' by changing it to the new value of 'var'
+
+var: Should be from a Variable().
+alpha: Scaling factor. Must be a scalar.
+delta: The change.
+lambda: The variance parameter.
+shadow: Same as "var".
+use_locking: If `True`, the subtraction will be protected by a lock;
+  otherwise the behavior is undefined, but may exhibit less contention.
+)doc");
+
+REGISTER_OP("ResourceApplyDelayCompensatedGradientDescent")
     .Input("var: resource")
     .Input("alpha: T")
     .Input("delta: T")

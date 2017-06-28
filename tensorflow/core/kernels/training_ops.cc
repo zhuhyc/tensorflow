@@ -516,6 +516,9 @@ class ApplyDelayCompensatedGradientDescentOp : public OpKernel {
   bool use_exclusive_lock_;
 };
 
+using CPUDevice = Eigen::ThreadPoolDevice;
+using GPUDevice = Eigen::GpuDevice;
+
 #define REGISTER_KERNELS(D, T)                                 \
   REGISTER_KERNEL_BUILDER(                                     \
       Name("ApplyDelayCompensatedGradientDescent")             \
@@ -530,6 +533,28 @@ TF_CALL_half(REGISTER_CPU_KERNELS);
 TF_CALL_float(REGISTER_CPU_KERNELS);
 TF_CALL_double(REGISTER_CPU_KERNELS);
 
+#if GOOGLE_CUDA
+// Forward declarations of the functor specializations for GPU.
+namespace functor {
+#define DECLARE_GPU_SPEC(T)                                             \
+  template <>                                                           \
+  void ApplyDelayCompensatedGradientDescent<GPUDevice, T>::operator()(  \
+      const GPUDevice& d, typename TTypes<T>::Flat var,                 \
+      typename TTypes<T>::ConstScalar lr,                               \
+      typename TTypes<T>::ConstFlat grad,                               \
+      typename TTypes<T>::ConstScalar variance,                         \
+      typename TTypes<T>::Flat shadow);                                 \
+  extern template struct ApplyDelayCompensatedGradientDescent<GPUDevice, T>;
+DECLARE_GPU_SPEC(Eigen::half);
+DECLARE_GPU_SPEC(float);
+DECLARE_GPU_SPEC(double);
+#undef DECLARE_GPU_SPEC
+}  // namespace functor
+
+REGISTER_KERNELS(GPU, Eigen::half);
+REGISTER_KERNELS(GPU, float);
+REGISTER_KERNELS(GPU, double);
+#endif
 #undef REGISTER_CPU_KERNELS
 #undef REGISTER_KERNELS
 
